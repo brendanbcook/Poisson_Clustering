@@ -4,21 +4,22 @@ Implemented by Brendan Cook
 '''
 
 import numpy as np
-import graphlearning as gl
 import matplotlib.pyplot as plt
 import sklearn.datasets as datasets
 from sklearn.cluster import KMeans
 import sklearn
 import seaborn as sns
-import kmeans1d
 import scipy
 import ipdb
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
+import graphlearning as gl
 # To-do: Finish poisson_topdown
 # Test poisson_kmeans
 
 # Test Datasets
-def gaussian_mixture():
+def gaussian_mixture(n, separation):
     #Make up some mixture of Gaussian data with 3 classes
     n = 500
     separation = 1
@@ -37,11 +38,8 @@ def build_graph(X, k=10):
     I,J,D = gl.knnsearch(X,k)
     W = gl.weight_matrix(I,J,D,k)
     W = gl.diag_multiply(W,0)
-    while not gl.isconnected(W):
-        k += 5
-        I,J,D = gl.knnsearch(X,k)
-        W = gl.weight_matrix(I,J,D,k)
-        W = gl.diag_multiply(W,0)
+    if not gl.isconnected(W):
+        print('Warning: Graph not connected')
     return W  
 
 ### Poisson K-means ###
@@ -49,46 +47,54 @@ def build_graph(X, k=10):
 def label_matrix(y):
     U, _ = gl.LabelsToVec(np.asarray(y))
     return U.transpose()
-def update_centroids(W, L, y_pred, indices, n, k, centroid_method):
-    if centroid_method == 'closest':
-        m = [np.mean(X[y_pred == j, :] ,axis=0) for j in range(k)]
-        centroids = [np.argmin(np.linalg.norm(X - m[j], axis=1)) for j in range(k)]
-    elif centroid_method == 'laplacian_eigenvector':
+
+def update_centroids(W, L, y_pred, indices, n, k, centroid_method, centroid_samples=None):
+    if centroid_method == 'laplacian_eigenvector':
         #eigenvectors = np.vstack((gl.dirichlet_eigenvectors(L, indices[y_pred != i] , 1)[0] for i in range(k)))
-        eigenvectors, _ = gl.dirichlet_eigenvectors(L, I=indices[y_pred != 0] , k=1)
-        for i in range(1,k):
-            new_eigenvector, _ = gl.dirichlet_eigenvectors(L, I=indices[y_pred != i] , k=1)
-            eigenvectors = np.vstack((eigenvectors, new_eigenvector))
-        centroids = np.argmax(np.abs(eigenvectors), axis=1)
+        # u_vals, _ = gl.dirichlet_eigenvectors(L, I=indices[y_pred != 0] , k=1)
+        # for i in range(1, k):
+        #     new_eigenvector, _ = gl.dirichlet_eigenvectors(L, I=indices[y_pred != i] , k=1)
+        #     u_vals = np.vstack((u_vals, new_eigenvector))
+        u_vals = np.vstack([gl.dirichlet_eigenvectors(L, I=indices[y_pred != i] , k=1)[0] for i in range(k)])
     elif centroid_method == 'poisson_solve':
-        u_vals = [gl.constrained_solve(L, I=indices[y_pred != i], g=np.zeros(len(indices[y_pred != i])), f=np.ones(n)) for i in range(k)]
-        centroids = [np.argmax(np.abs(u)) for u in u_vals]
+        u_vals = np.vstack([gl.constrained_solve(L, I=indices[y_pred != i], g=np.zeros(len(indices[y_pred != i])), f=np.ones(n)) for i in range(k)])
     elif centroid_method == 'dijkstra':
-        u_vals = [gl.cDijkstra(W, I=indices[y_pred != i], g=np.zeros(len(indices[y_pred != i]))) for i in range(k)]
-        centroids = [np.argmax(u) for u in u_vals]
+        u_vals = np.vstack([gl.cDijkstra(W, I=indices[y_pred != i], g=np.zeros(len(indices[y_pred != i]))) for i in range(k)])
     else:
-        raise Exception('Invalid Centroid Method')
-    return centroids
-def poisson_cluster_kmeans(W, y, L, k, centroid_method='dijkstra', centroid_inits=None, max_iter=20, num_starts=1, show_plot=False):
+        raise ValueError('Invalid Centroid Method')
+    u_vals = np.abs(u_vals)
+    if centroid_samples is None:
+        centroids = np.argmax(u_vals, axis=1)
+        labels = np.arange(k)
+    elif type(centroid_samples) != int:
+        raise ValueError('centroid_samples must be an integer')
+    else:
+        probs = u_vals**1 / np.sum(u_vals**1, axis=1, keepdims=True)
+        centroids, labels = [], []
+        for i in range(k):
+            centroids.append(np.random.choice(indices, size=centroid_samples, replace=False, p=probs[i, :]))
+            labels.append([i]*centroid_samples)
+        centroids, labels = np.array(centroids), np.array(labels)
+    return centroids, labels
+def poisson_cluster_kmeans(W, L, k, centroid_method='dijkstra', centroid_inits=None, num_iter=10, num_starts=1, centroid_samples=None, show_plot=False, y=None):
     #Randomly choose k labeled points
     n = W.shape[0]
     L = gl.graph_laplacian(W)
     indices = np.arange(n)
     run_metrics = []
     y_preds = []
+    centroid_labels = np.arange(k)
     if not centroid_inits:
         centroid_inits = [np.random.choice(indices,size=k,replace=False) for _ in range(num_starts)]
     for centroids in centroid_inits:
-        # Main loop
-        for i in range(max_iter):
+        for _ in range(num_iter):
             #Semi-supervised learning 
-            y_pred = gl.graph_ssl(W, centroids, np.arange(k),method='poisson')
-            centroids = update_centroids(W, L, y_pred, indices, n, k, centroid_method)
+            y_pred = gl.graph_ssl(W, centroids, centroid_labels,method='poisson')
+            centroids, centroid_labels = update_centroids(W, L, y_pred, indices, n, k, centroid_method)
         y_preds.append(y_pred)
         run_metrics.append(graph_cut(L, label_matrix(y_pred)))
     best_index = np.argmin(run_metrics)
-    return y_preds[best_index]
-            
+    return y_preds[best_index]       
 # Bottom up approach.
 def withinss(x, n):
     x = np.sort(x)
@@ -233,7 +239,7 @@ def poisson_cluster_top(W, n_clusters=2, use_cuda=False):
     return U
 
 ### Experiments ###
-def experiment(X, y, W, L, centroid_methods = ['dijkstra', 'poisson_solve', 'laplacian_eigenvector'], centroid_inits=None, show_plot=False, num_starts=3, include=['poisson_kmeans']):
+def experiment(X, y, W, L, centroid_methods = ['dijkstra', 'poisson_solve', 'laplacian_eigenvector'], centroid_inits=None, show_plot=False, num_starts=3, centroid_samples=None):
     k=len(np.unique(y))
     n = len(X)
     indices = np.arange(n)
@@ -241,10 +247,11 @@ def experiment(X, y, W, L, centroid_methods = ['dijkstra', 'poisson_solve', 'lap
         centroid_inits = [np.random.choice(indices,size=k,replace=False) for _ in range(num_starts)]
     sns.scatterplot(x=X[:, 0], y=X[:, 1], hue=y).set(title='Ground Truth')
     plt.show()
-    #poisson_cluster_bottom(W, L, len(np.unique(y)))
     # Poisson k-means
     try:
-        y_kmeans = {method: poisson_cluster_kmeans(W, y, L, k, centroid_method=method, num_starts=num_starts, centroid_inits=centroid_inits) for method in centroid_methods}
+        y_kmeans = {}
+        for method in centroid_methods:
+            y_kmeans[method] = poisson_cluster_kmeans(W, L, k, centroid_method=method, num_starts=num_starts, centroid_inits=centroid_inits, centroid_samples=centroid_samples)
     except:
         print('Encountered an error in running poisson k-means')
         print(f'centroid inits: {centroid_inits}')
@@ -266,9 +273,6 @@ def experiment(X, y, W, L, centroid_methods = ['dijkstra', 'poisson_solve', 'lap
         for method, y_pred in y_kmeans.items():
             print(f"Poisson Clustering ({method}) {name}={metric(y, y_pred)}")
 
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-
 if __name__ == "__main__":
     X, y = datasets.load_wine(return_X_y=True)
     indices = np.arange(X.shape[0])
@@ -279,4 +283,4 @@ if __name__ == "__main__":
     X = pca.fit_transform(X_scale)
     W = build_graph(X)
     L = gl.graph_laplacian(W)
-    poisson_cluster_bottom(W, L, len(np.unique(y)))
+    #poisson_cluster_bottom(W, L, len(np.unique(y)))
